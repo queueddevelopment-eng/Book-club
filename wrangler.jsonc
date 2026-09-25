@@ -14,8 +14,7 @@
     {
       "binding": "DB",
       "database_name": "book-club",
-      // Replace with the id printed by `npx wrangler d1 create book-club`
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "8a464445-7af6-44df-9930-d3d7d71037ce",
       "migrations_dir": "migrations"
     }
   ],
