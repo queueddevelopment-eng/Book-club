@@ -9,12 +9,28 @@ let me = null;
 const esc = (v) =>
   String(v ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 
+let appVersion = null;
+let reloading = false;
+
+/** Reloads the page once the server reports a newer deploy than the one this tab loaded. */
+function checkVersion(res) {
+  const v = res.headers.get('X-App-Version');
+  if (!v) return;
+  if (!appVersion) appVersion = v;
+  else if (v !== appVersion && !reloading) {
+    reloading = true;
+    toast('The app was just updated — reloading…');
+    setTimeout(() => location.reload(), 1200);
+  }
+}
+
 async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(`/api${path}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
+  checkVersion(res);
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && path !== '/join') {
     me = null;
@@ -1042,7 +1058,9 @@ document.getElementById('logout').addEventListener(
 window.addEventListener('hashchange', route);
 
 (async () => {
-  config = await fetch('/api/config').then((r) => r.json()).catch(() => config);
+  config = await fetch('/api/config')
+    .then((r) => (checkVersion(r), r.json()))
+    .catch(() => config);
   document.title = config.clubName;
   document.getElementById('club-name').textContent = config.clubName;
   try {

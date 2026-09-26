@@ -20,6 +20,8 @@
   ],
   // Workers AI is the fallback for talking points when ANTHROPIC_API_KEY is not set.
   "ai": { "binding": "AI" },
+  // Lets open browser tabs notice a new deploy and reload.
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "vars": {
     "CLUB_NAME": "Book Club",
     // How much having already read a book counts against it (0 = no effect, 1 = a book

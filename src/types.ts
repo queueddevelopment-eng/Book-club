@@ -1,6 +1,7 @@
 export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
+  CF_VERSION_METADATA?: { id: string };
   AI?: Ai;
   CLUB_NAME?: string;
   CLUB_PASSCODE?: string;

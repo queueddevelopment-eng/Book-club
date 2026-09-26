@@ -8,6 +8,13 @@ import type { AppEnv, Env } from './types';
 
 const app = new Hono<AppEnv>();
 
+// Tell the frontend which deploy answered, so a tab left open across an update can reload itself.
+app.use('/api/*', async (c, next) => {
+  await next();
+  const version = c.env.CF_VERSION_METADATA?.id;
+  if (version) c.header('X-App-Version', version);
+});
+
 class HttpError extends Error {
   constructor(public status: 400 | 403 | 404 | 409, message: string) {
     super(message);
