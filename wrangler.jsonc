@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "book-club",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "book-club",
+      "database_id": "8a464445-7af6-44df-9930-d3d7d71037ce",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Workers AI is the fallback for talking points when ANTHROPIC_API_KEY is not set.
+  "ai": { "binding": "AI" },
+  // Lets open browser tabs notice a new deploy and reload.
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  "vars": {
+    "CLUB_NAME": "Book Club",
+    // How much having already read a book counts against it (0 = no effect, 1 = a book
+    // everyone has read can never win).
+    "READ_PENALTY": "0.5",
+    "CLAUDE_MODEL": "claude-opus-5"
+  }
+  // Secrets (set with `npx wrangler secret put NAME`):
+  //   CLUB_PASSCODE       - shared passcode members need to join
+  //   ANTHROPIC_API_KEY   - optional; enables Claude for talking points
+  //   GOOGLE_BOOKS_API_KEY - optional; raises Google Books rate limits
+}

@@ -1,0 +1,35 @@
+{
+  "name": "book-club",
+  "version": "1.0.0",
+  "description": "Book club app: suggest, vote on, review and discuss books",
+  "scripts": {
+    "dev": "wrangler dev",
+    "db:migrate:local": "wrangler d1 migrations apply book-club --local",
+    "db:migrate": "wrangler d1 migrations apply book-club --remote",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc",
+    "test": "vitest run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/queueddevelopment-eng/Book-club.git"
+  },
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/queueddevelopment-eng/Book-club/issues"
+  },
+  "homepage": "https://github.com/queueddevelopment-eng/Book-club#readme",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
+    "hono": "^4.13.9",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260925.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2",
+    "wrangler": "^4.140.0"
+  },
+  "private": true,
+  "type": "module"
+}

@@ -1,0 +1,18 @@
+export interface Env {
+  DB: D1Database;
+  ASSETS: Fetcher;
+  CF_VERSION_METADATA?: { id: string };
+  AI?: Ai;
+  CLUB_NAME?: string;
+  CLUB_PASSCODE?: string;
+  READ_PENALTY?: string;
+  CLAUDE_MODEL?: string;
+  ANTHROPIC_API_KEY?: string;
+  ANTHROPIC_WORKSPACE_ID?: string;
+  GOOGLE_BOOKS_API_KEY?: string;
+}
+
+export interface AppEnv {
+  Bindings: Env;
+  Variables: { member: { id: number; name: string } };
+}
