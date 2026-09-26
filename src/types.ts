@@ -7,6 +7,7 @@ export interface Env {
   READ_PENALTY?: string;
   CLAUDE_MODEL?: string;
   ANTHROPIC_API_KEY?: string;
+  ANTHROPIC_WORKSPACE_ID?: string;
   GOOGLE_BOOKS_API_KEY?: string;
 }
 

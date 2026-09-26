@@ -94,6 +94,22 @@ describe('talking points', () => {
     await expect(generateTalkingPoints({ ANTHROPIC_API_KEY: 'k' }, { title: 'x', authors: 'y' }, [])).rejects.toThrow(/declined/);
   });
 
+  it('sends the workspace header, and falls back to Workers AI when Claude fails', async () => {
+    let headers: Headers | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      headers = new Headers(init.headers);
+      return json({ type: 'error', error: { type: 'invalid_request_error', message: 'bad key' } }, 400);
+    }));
+    const ai = { run: vi.fn(async () => ({ response: JSON.stringify(points) })) };
+    const r = await generateTalkingPoints(
+      { ANTHROPIC_API_KEY: 'k', ANTHROPIC_WORKSPACE_ID: 'wrkspc_1', AI: ai as any },
+      { title: 'Circe', authors: 'Madeline Miller' },
+      [],
+    );
+    expect(headers?.get('anthropic-workspace-id')).toBe('wrkspc_1');
+    expect(r.model).toContain('llama');
+  });
+
   it('uses Workers AI when there is no Anthropic key', async () => {
     const ai = { run: vi.fn(async () => ({ response: `Sure! ${JSON.stringify(points)}` })) };
     const r = await generateTalkingPoints({ AI: ai as any }, { title: 'Circe', authors: 'Madeline Miller' }, []);

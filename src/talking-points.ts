@@ -29,6 +29,7 @@ export interface BookForPrompt {
 
 export interface LlmEnv {
   ANTHROPIC_API_KEY?: string;
+  ANTHROPIC_WORKSPACE_ID?: string;
   CLAUDE_MODEL?: string;
   AI?: Ai;
 }
@@ -58,13 +59,25 @@ export async function generateTalkingPoints(
   book: BookForPrompt,
   reviews: string[],
 ): Promise<{ points: TalkingPoints; model: string }> {
-  if (env.ANTHROPIC_API_KEY) return generateWithClaude(env, book, reviews);
+  if (env.ANTHROPIC_API_KEY) {
+    try {
+      return await generateWithClaude(env, book, reviews);
+    } catch (err) {
+      // Keep the feature working if the key is misconfigured or Claude is unavailable.
+      if (!env.AI) throw err;
+      console.error('Claude failed, falling back to Workers AI:', err);
+    }
+  }
   if (env.AI) return generateWithWorkersAi(env.AI, book, reviews);
   throw new Error('No LLM configured. Set the ANTHROPIC_API_KEY secret or enable the Workers AI binding.');
 }
 
 async function generateWithClaude(env: LlmEnv, book: BookForPrompt, reviews: string[]) {
-  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
+  const client = new Anthropic({
+    apiKey: env.ANTHROPIC_API_KEY,
+    // Needed for API keys that aren't scoped to a single workspace.
+    defaultHeaders: env.ANTHROPIC_WORKSPACE_ID ? { 'anthropic-workspace-id': env.ANTHROPIC_WORKSPACE_ID } : undefined,
+  });
   const model = env.CLAUDE_MODEL || 'claude-opus-5';
   const response = await client.beta.messages.parse({
     model,

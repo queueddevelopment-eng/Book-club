@@ -316,7 +316,7 @@ function bindProgressForm(bookId) {
  * Renders a search box that looks books up via Google Books / Open Library.
  * onPick receives the saved book's id.
  */
-function bookSearch(container, { onPick, cta = 'Add' }) {
+function bookSearch(container, { onPick, cta = 'Add', extra = () => ({}) }) {
   container.innerHTML = `
     <form class="row search-form">
       <input type="search" placeholder="Search by title, author or ISBN…" style="flex:1;min-width:200px" required />
@@ -361,7 +361,7 @@ function bookSearch(container, { onPick, cta = 'Add' }) {
           'click',
           action(async (e) => {
             btn.textContent = 'Fetching details…';
-            const { id } = await api('/books', { method: 'POST', body: { sourceId: items[Number(e.currentTarget.dataset.i)].sourceId } });
+            const { id } = await api('/books', { method: 'POST', body: { sourceId: items[Number(e.currentTarget.dataset.i)].sourceId, ...extra() } });
             await onPick(id);
           }),
         ),
@@ -372,8 +372,122 @@ function bookSearch(container, { onPick, cta = 'Add' }) {
     'submit',
     action(async (e) => {
       const f = new FormData(e.target);
-      const { id } = await api('/books', { method: 'POST', body: { title: f.get('title'), authors: f.get('authors') } });
+      const { id } = await api('/books', { method: 'POST', body: { title: f.get('title'), authors: f.get('authors'), ...extra() } });
       await onPick(id);
+    }),
+  );
+}
+
+// ------------------------------------------------------------ suggestions (shared)
+
+/** Fills the <datalist> used by "Suggested by" inputs with member names. */
+async function loadMemberNames() {
+  const list = document.getElementById('member-names');
+  if (list.dataset.loaded) return;
+  const { members } = await api('/members');
+  list.innerHTML = members.map((m) => `<option value="${esc(m.name)}"></option>`).join('');
+  list.dataset.loaded = '1';
+}
+
+/** "Suggest a book" box: who suggested it, an optional pitch, then search or manual entry. */
+function suggestBox(container, onDone) {
+  container.innerHTML = `
+    <div class="row">
+      <div style="flex:1;min-width:160px"><label for="s-by">Suggested by</label>
+        <input id="s-by" list="member-names" maxlength="60" value="${esc(me.name)}" /></div>
+      <div style="flex:3;min-width:220px"><label for="s-pitch">Why this one? <span class="muted small">(optional)</span></label>
+        <input id="s-pitch" maxlength="1000" placeholder="It’s short, it’s funny, and the ending will start arguments." /></div>
+    </div>
+    <div class="s-search" style="margin-top:12px"></div>`;
+  loadMemberNames().catch(() => {});
+  bookSearch($('.s-search', container), {
+    cta: 'Suggest',
+    extra: () => ({ suggestedBy: $('#s-by', container).value, pitch: $('#s-pitch', container).value }),
+    onPick: async (id) => {
+      toast('Book suggested!');
+      await onDone(id);
+    },
+  });
+}
+
+function editBookForm(b) {
+  const id = b.book_id ?? b.id;
+  const removable = !b.club_pick;
+  return `
+    <form class="edit-book card flat stack small" data-book="${id}" hidden style="background:var(--surface-2)">
+      <div><label>Suggested by</label><input name="suggested_by" list="member-names" maxlength="60" value="${esc(b.suggested_by ?? '')}" /></div>
+      <div><label>Pitch</label><input name="pitch" maxlength="1000" value="${esc(b.pitch ?? '')}" placeholder="Why read this one?" /></div>
+      <div><label>Title</label><input name="title" maxlength="300" required value="${esc(b.title)}" /></div>
+      <div><label>Author</label><input name="authors" maxlength="300" value="${esc(b.authors ?? '')}" /></div>
+      <div class="row">
+        <button class="primary small" type="submit">Save</button>
+        <button class="small" type="button" data-cancel-edit="${id}">Cancel</button>
+        ${removable ? `<button class="link small" type="button" data-delete-book="${id}" style="margin-left:auto">Remove suggestion</button>` : ''}
+      </div>
+    </form>`;
+}
+
+/** A suggestion card with "Suggested by", pitch, the already-read toggle and inline editing. */
+function bookCard(b, { editable = true } = {}) {
+  const id = b.book_id ?? b.id;
+  return `
+    <div class="card book-card" data-text="${esc(`${b.title} ${b.authors} ${b.suggested_by ?? ''}`.toLowerCase())}">
+      <a href="#/books/${id}">${cover(b)}</a>
+      <div>
+        <a class="title" href="#/books/${id}">${esc(b.title)}</a>
+        <div class="small muted">${esc(b.authors)}${b.published ? ` · ${esc(String(b.published).slice(0, 4))}` : ''}${b.page_count ? ` · ${b.page_count}p` : ''}</div>
+      </div>
+      <div class="small">Suggested by: <strong>${esc(b.suggested_by || 'unknown')}</strong></div>
+      ${b.pitch ? `<div class="small">“${esc(b.pitch)}”</div>` : ''}
+      ${b.read_count ? `<div class="small"><span class="pill warn">Already read by ${esc(b.read_by)}</span></div>` : ''}
+      ${
+        editable
+          ? `<label class="row small" style="font-weight:400;gap:6px;margin:0">
+              <input type="checkbox" data-read="${id}" ${b.read_by_me ? 'checked' : ''} /> I’ve read this before
+            </label>
+            <button class="link small" data-edit="${id}" style="align-self:flex-start">✎ Edit</button>
+            ${editBookForm(b)}`
+          : ''
+      }
+    </div>`;
+}
+
+/** Wires up the read toggles and edit forms rendered by bookCard / editBookForm. */
+function bindBookCards({ afterDelete = refresh } = {}) {
+  on(
+    '[data-read]',
+    'change',
+    action(async (e) => {
+      await api(`/books/${e.target.dataset.read}/read`, { method: 'PUT', body: { read: e.target.checked } });
+      await refresh();
+    }),
+  );
+  const form = (id) => $(`form.edit-book[data-book="${id}"]`);
+  on('[data-edit]', 'click', (e) => {
+    loadMemberNames().catch(() => {});
+    const f = form(e.currentTarget.dataset.edit);
+    f.hidden = !f.hidden;
+    if (!f.hidden) f.querySelector('input').focus();
+  });
+  on('[data-cancel-edit]', 'click', (e) => (form(e.currentTarget.dataset.cancelEdit).hidden = true));
+  on(
+    'form.edit-book',
+    'submit',
+    action(async (e) => {
+      const f = new FormData(e.target);
+      await api(`/books/${e.target.dataset.book}`, { method: 'PATCH', body: Object.fromEntries(f) });
+      toast('Saved');
+      await refresh();
+    }),
+  );
+  on(
+    '[data-delete-book]',
+    'click',
+    action(async (e) => {
+      if (!confirm('Remove this book from the suggestions? Any votes for it will be dropped.')) return;
+      await api(`/books/${e.currentTarget.dataset.deleteBook}`, { method: 'DELETE' });
+      toast('Suggestion removed');
+      await afterDelete();
     }),
   );
 }
@@ -413,16 +527,13 @@ async function renderMeeting(id) {
     ${decided ? decidedHtml(m, chosen) : ''}
 
     <section>
-      <div class="row spread"><h2>Suggestions (${suggestions.length})</h2>
+      <div class="row spread"><h2>${decided ? 'What was on the ballot' : 'Suggestions'} (${suggestions.length})</h2>
         ${!decided ? `<button class="primary small" id="show-suggest">+ Suggest a book</button>` : ''}</div>
-      <div id="suggest-box" class="card" hidden>
-        <div><label for="pitch">Why this one? <span class="muted small">(optional pitch)</span></label>
-          <input id="pitch" maxlength="1000" placeholder="It’s short, it’s funny, and the ending will start arguments." /></div>
-        <div id="search" style="margin-top:12px"></div>
-      </div>
+      ${!decided ? `<p class="small muted" style="margin-top:-6px">Every book on the <a href="#/library">Suggestions</a> page is in the running.</p>` : ''}
+      <div id="suggest-box" class="card" hidden></div>
       ${
         suggestions.length
-          ? `<div class="grid" style="margin-top:12px">${suggestions.map((s) => suggestionCard(s, m)).join('')}</div>`
+          ? `<div class="grid" style="margin-top:12px">${suggestions.map((s) => bookCard(s, { editable: !decided })).join('')}</div>`
           : `<div class="card flat empty">No suggestions yet — be the first!</div>`
       }
     </section>
@@ -457,35 +568,10 @@ async function renderMeeting(id) {
   on('#show-suggest', 'click', () => {
     const box = $('#suggest-box');
     box.hidden = !box.hidden;
-    if (!box.hidden) $('#search input').focus();
+    if (!box.hidden) $('.s-search input[type=search]').focus();
   });
-  if ($('#search')) {
-    bookSearch($('#search'), {
-      cta: 'Suggest',
-      onPick: async (bookId) => {
-        await api(`/meetings/${id}/suggestions`, { method: 'POST', body: { bookId, pitch: $('#pitch').value } });
-        toast('Book suggested!');
-        await refresh();
-      },
-    });
-  }
-  on(
-    '[data-remove]',
-    'click',
-    action(async (e) => {
-      if (!confirm('Remove this suggestion? Any votes for it will be dropped.')) return;
-      await api(`/meetings/${id}/suggestions/${e.currentTarget.dataset.remove}`, { method: 'DELETE' });
-      await refresh();
-    }),
-  );
-  on(
-    '[data-read]',
-    'change',
-    action(async (e) => {
-      await api(`/books/${e.target.dataset.read}/read`, { method: 'PUT', body: { read: e.target.checked } });
-      await refresh();
-    }),
-  );
+  if ($('#suggest-box')) suggestBox($('#suggest-box'), () => refresh());
+  bindBookCards();
 
   // --- stage + method
   on(
@@ -534,25 +620,6 @@ async function renderMeeting(id) {
       $('.winner')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }),
   );
-}
-
-function suggestionCard(s, m) {
-  const canRemove = m.status !== 'decided' && (s.member_id === me.id || m.created_by === me.id);
-  return `
-    <div class="card book-card">
-      <a href="#/books/${s.book_id}">${cover(s)}</a>
-      <div>
-        <a class="title" href="#/books/${s.book_id}">${esc(s.title)}</a>
-        <div class="small muted">${esc(s.authors)}${s.published ? ` · ${esc(String(s.published).slice(0, 4))}` : ''}${s.page_count ? ` · ${s.page_count}p` : ''}</div>
-      </div>
-      <div class="small">Suggested by <strong>${esc(s.suggested_by ?? 'someone')}</strong></div>
-      ${s.pitch ? `<div class="small">“${esc(s.pitch)}”</div>` : ''}
-      ${s.read_count ? `<div class="small"><span class="pill warn">Already read by ${esc(s.read_by)}</span></div>` : ''}
-      <label class="row small" style="font-weight:400;gap:6px;margin:0">
-        <input type="checkbox" data-read="${s.book_id}" ${s.read_by_me ? 'checked' : ''} /> I’ve read this before
-      </label>
-      ${canRemove ? `<button class="link small" data-remove="${s.book_id}" style="align-self:flex-start">Remove</button>` : ''}
-    </div>`;
 }
 
 function votingHtml(m, suggestions, methodVotes, myMethod, effectiveMethod, myRanking, myApprovals, voters, standings) {
@@ -768,6 +835,13 @@ async function renderBook(id) {
       <div>
         <h1 style="margin-bottom:4px">${esc(book.title)}</h1>
         <div class="muted">${esc(book.authors)}${book.published ? ` · ${esc(book.published)}` : ''}${book.page_count ? ` · ${book.page_count} pages` : ''}</div>
+        <div class="row small" style="margin-top:6px">
+          <span>Suggested by: <strong>${esc(book.suggested_by || 'unknown')}</strong></span>
+          ${book.in_pool ? `<span class="pill accent">In the running for the next pick</span>` : ''}
+          <button class="link small" data-edit="${book.id}">✎ Edit</button>
+        </div>
+        ${book.pitch ? `<p class="small" style="margin:6px 0 0">“${esc(book.pitch)}”</p>` : ''}
+        ${editBookForm(book)}
         <div class="row" style="margin-top:8px">
           ${reviews.length ? `${stars(avg)} <span class="small muted">${avg.toFixed(1)} from ${reviews.length} review${reviews.length === 1 ? '' : 's'}</span>` : ''}
           ${book.categories ? book.categories.split(', ').slice(0, 3).map((c) => `<span class="pill">${esc(c)}</span>`).join('') : ''}
@@ -834,6 +908,7 @@ async function renderBook(id) {
     }),
   );
   bindProgressForm(id);
+  bindBookCards({ afterDelete: () => (location.hash = '#/library') });
 
   let rating = myReview?.rating ?? 0;
   on('[data-star]', 'click', (e) => {
@@ -912,33 +987,28 @@ function bindTalkingPoints(bookId) {
 
 async function renderLibrary() {
   const { books } = await api('/books');
+  const pool = books.filter((b) => b.in_pool);
+  const picks = books.filter((b) => !b.in_pool && b.club_pick);
+  const others = books.filter((b) => !b.in_pool && !b.club_pick);
+  const grid = (list, opts) => `<div class="grid">${list.map((b) => bookCard(b, opts)).join('')}</div>`;
   app.innerHTML = `
-    <div class="row spread"><h1>Library</h1><button class="primary" id="add-book">+ Add a book</button></div>
-    <div id="add-box" class="card" hidden><div id="search"></div></div>
-    <div class="row" style="margin:12px 0"><input id="filter" type="search" placeholder="Filter the library…" style="max-width:320px" /></div>
-    ${
-      books.length
-        ? `<div class="grid" id="books">${books
-            .map(
-              (b) => `
-          <a class="card book-card" href="#/books/${b.id}" style="color:inherit;text-decoration:none" data-text="${esc(`${b.title} ${b.authors}`.toLowerCase())}">
-            ${cover(b)}
-            <div><div class="title">${esc(b.title)}</div><div class="small muted">${esc(b.authors)}</div></div>
-            <div class="row small">
-              ${b.club_read_date ? `<span class="pill good">Club pick · ${esc(fmtDate(b.club_read_date))}</span>` : ''}
-              ${b.review_count ? `${stars(b.avg_rating)} <span class="muted">(${b.review_count})</span>` : ''}
-              ${b.read_count ? `<span class="pill">${b.read_count} read before</span>` : ''}
-            </div>
-          </a>`,
-            )
-            .join('')}</div>`
-        : `<div class="card flat empty">No books yet. Suggest one for a meeting or add one here.</div>`
-    }`;
+    <div class="row spread"><h1>Suggestions</h1><button class="primary" id="add-book">+ Suggest a book</button></div>
+    <p class="muted" style="margin-top:-6px">Every book here is in the running when the next meeting votes. The winner moves to “Books we’ve read”.</p>
+    <div id="add-box" class="card" hidden></div>
+    ${books.length ? `<div class="row" style="margin:12px 0"><input id="filter" type="search" placeholder="Filter by title, author or who suggested it…" style="max-width:360px" /></div>` : ''}
+    <div id="books">
+      <h2>Up for the next pick (${pool.length})</h2>
+      ${pool.length ? grid(pool) : `<div class="card flat empty">No suggestions yet. Add one with “Suggest a book”.</div>`}
+      ${picks.length ? `<h2>Books we’ve read (${picks.length})</h2>${grid(picks, { editable: false })}` : ''}
+      ${others.length ? `<h2>Other books</h2>${grid(others)}` : ''}
+    </div>`;
   on('#add-book', 'click', () => {
-    $('#add-box').hidden = !$('#add-box').hidden;
-    $('#search input')?.focus();
+    const box = $('#add-box');
+    box.hidden = !box.hidden;
+    if (!box.hidden) $('.s-search input[type=search]').focus();
   });
-  bookSearch($('#search'), { cta: 'Add', onPick: (id) => (location.hash = `#/books/${id}`) });
+  suggestBox($('#add-box'), () => refresh());
+  bindBookCards();
   on('#filter', 'input', (e) => {
     const q = e.target.value.toLowerCase();
     $$('#books [data-text]').forEach((el) => (el.style.display = el.dataset.text.includes(q) ? '' : 'none'));

@@ -102,7 +102,7 @@ app.get('/api/members', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT m.id, m.name, m.created_at,
        (SELECT COUNT(*) FROM reviews r WHERE r.member_id = m.id) AS review_count,
-       (SELECT COUNT(*) FROM suggestions s WHERE s.member_id = m.id) AS suggestion_count
+       (SELECT COUNT(*) FROM books b WHERE b.suggested_by = m.name COLLATE NOCASE) AS suggestion_count
      FROM members m ORDER BY m.name`,
   ).all();
   return c.json({ members: results });
@@ -117,18 +117,31 @@ app.get('/api/search', async (c) => {
 });
 
 app.post('/api/books', async (c) => {
-  const body = await c.req.json<{ sourceId?: string; title?: string; authors?: string }>();
+  const body = await c.req.json<{ sourceId?: string; title?: string; authors?: string; suggestedBy?: string; pitch?: string }>();
   const member = c.get('member');
+  const suggestedBy = text(body.suggestedBy, 60) ?? member.name;
+  const pitch = text(body.pitch, 1000);
 
   if (body.sourceId) {
-    const existing = await c.env.DB.prepare('SELECT id FROM books WHERE source_id = ?').bind(body.sourceId).first<{ id: number }>();
-    if (existing) return c.json({ id: existing.id });
+    const existing = await c.env.DB.prepare('SELECT id, in_pool, suggested_by FROM books WHERE source_id = ?')
+      .bind(body.sourceId)
+      .first<{ id: number; in_pool: number; suggested_by: string | null }>();
+    if (existing?.in_pool) {
+      throw new HttpError(409, `That book is already in the suggestions${existing.suggested_by ? ` (suggested by ${existing.suggested_by})` : ''}`);
+    }
+    if (existing) {
+      // A book the club has read before, suggested again.
+      await c.env.DB.prepare('UPDATE books SET in_pool = 1, suggested_by = ?, pitch = ? WHERE id = ?')
+        .bind(suggestedBy, pitch, existing.id)
+        .run();
+      return c.json({ id: existing.id });
+    }
     const d = await getBookDetails(body.sourceId, c.env.GOOGLE_BOOKS_API_KEY);
     if (!d) throw new HttpError(404, "Couldn't load that book's details — try again or add it manually");
     const row = await c.env.DB.prepare(
       `INSERT INTO books (title, authors, description, cover_url, published, page_count, isbn, categories,
-         author_bio, author_photo_url, source_id, added_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+         author_bio, author_photo_url, source_id, added_by, suggested_by, pitch)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
     )
       .bind(
         d.title,
@@ -143,6 +156,8 @@ app.post('/api/books', async (c) => {
         d.authorPhotoUrl ?? null,
         d.sourceId,
         member.id,
+        suggestedBy,
+        pitch,
       )
       .first<{ id: number }>();
     return c.json({ id: row!.id });
@@ -150,21 +165,32 @@ app.post('/api/books', async (c) => {
 
   const title = text(body.title, 300);
   if (!title) throw new HttpError(400, 'A title is required');
-  const row = await c.env.DB.prepare('INSERT INTO books (title, authors, added_by) VALUES (?, ?, ?) RETURNING id')
-    .bind(title, text(body.authors, 300) ?? '', member.id)
+  const dupe = await c.env.DB.prepare('SELECT suggested_by FROM books WHERE in_pool = 1 AND title = ? COLLATE NOCASE')
+    .bind(title)
+    .first<{ suggested_by: string | null }>();
+  if (dupe) throw new HttpError(409, `That book is already in the suggestions${dupe.suggested_by ? ` (suggested by ${dupe.suggested_by})` : ''}`);
+  const row = await c.env.DB.prepare(
+    'INSERT INTO books (title, authors, added_by, suggested_by, pitch) VALUES (?, ?, ?, ?, ?) RETURNING id',
+  )
+    .bind(title, text(body.authors, 300) ?? '', member.id, suggestedBy, pitch)
     .first<{ id: number }>();
   return c.json({ id: row!.id });
 });
 
 app.get('/api/books', async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT b.id, b.title, b.authors, b.cover_url, b.published,
+    `SELECT b.id, b.title, b.authors, b.cover_url, b.published, b.suggested_by, b.pitch, b.in_pool,
        (SELECT ROUND(AVG(rating), 1) FROM reviews r WHERE r.book_id = b.id) AS avg_rating,
        (SELECT COUNT(*) FROM reviews r WHERE r.book_id = b.id) AS review_count,
        (SELECT COUNT(*) FROM read_before rb WHERE rb.book_id = b.id) AS read_count,
-       (SELECT MAX(meeting_date) FROM meetings m WHERE m.chosen_book_id = b.id) AS club_read_date
-     FROM books b ORDER BY b.created_at DESC`,
-  ).all();
+       (SELECT GROUP_CONCAT(m.name, ', ') FROM read_before rb JOIN members m ON m.id = rb.member_id WHERE rb.book_id = b.id) AS read_by,
+       EXISTS (SELECT 1 FROM read_before rb WHERE rb.book_id = b.id AND rb.member_id = ?) AS read_by_me,
+       (SELECT MAX(meeting_date) FROM meetings m WHERE m.chosen_book_id = b.id) AS club_read_date,
+       EXISTS (SELECT 1 FROM meetings m WHERE m.chosen_book_id = b.id) AS club_pick
+     FROM books b ORDER BY b.in_pool DESC, b.created_at DESC`,
+  )
+    .bind(c.get('member').id)
+    .all();
   return c.json({ books: results });
 });
 
@@ -200,7 +226,12 @@ app.get('/api/books/:id', async (c) => {
   const tpRow = tp.results[0] as { content_json: string; model: string; created_at: string } | undefined;
   const links = storeLinks(book.title, book.authors);
   return c.json({
-    book: { ...book, audible_link: book.audible_url || links.audible, kindle_link: book.kindle_url || links.kindle },
+    book: {
+      ...book,
+      club_pick: meetings.results.some((m: any) => m.chosen),
+      audible_link: book.audible_url || links.audible,
+      kindle_link: book.kindle_url || links.kindle,
+    },
     reviews: reviews.results,
     progress: progress.results,
     readers: readers.results,
@@ -224,10 +255,27 @@ app.patch('/api/books/:id', async (c) => {
   if ('kindle_url' in body) fields.push(['kindle_url', url(body.kindle_url)]);
   if ('cover_url' in body) fields.push(['cover_url', url(body.cover_url)]);
   if ('description' in body) fields.push(['description', text(body.description, 20000)]);
+  if ('title' in body) {
+    const t = text(body.title, 300);
+    if (!t) throw new HttpError(400, 'Title cannot be empty');
+    fields.push(['title', t]);
+  }
+  if ('authors' in body) fields.push(['authors', text(body.authors, 300) ?? '']);
+  if ('suggested_by' in body) fields.push(['suggested_by', text(body.suggested_by, 60)]);
+  if ('pitch' in body) fields.push(['pitch', text(body.pitch, 1000)]);
   if (!fields.length) return c.json({ ok: true });
   await c.env.DB.prepare(`UPDATE books SET ${fields.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ?`)
     .bind(...fields.map(([, v]) => v), id)
     .run();
+  return c.json({ ok: true });
+});
+
+app.delete('/api/books/:id', async (c) => {
+  const id = intParam(c.req.param('id'));
+  await loadBook(c.env, id);
+  const picked = await c.env.DB.prepare('SELECT 1 FROM meetings WHERE chosen_book_id = ?').bind(id).first();
+  if (picked) throw new HttpError(409, "This book was a club pick, so it stays in the club's history");
+  await c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id).run();
   return c.json({ ok: true });
 });
 
@@ -314,7 +362,8 @@ app.get('/api/meetings', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT mt.id, mt.title, mt.meeting_date, mt.location, mt.status, mt.method, mt.chosen_book_id,
        b.title AS book_title, b.authors AS book_authors, b.cover_url AS book_cover,
-       (SELECT COUNT(*) FROM suggestions s WHERE s.meeting_id = mt.id) AS suggestion_count
+       CASE WHEN mt.status = 'decided' THEN (SELECT COUNT(*) FROM suggestions s WHERE s.meeting_id = mt.id)
+         ELSE (SELECT COUNT(*) FROM books WHERE in_pool = 1) END AS suggestion_count
      FROM meetings mt LEFT JOIN books b ON b.id = mt.chosen_book_id
      ORDER BY CASE WHEN mt.meeting_date IS NULL THEN 1 ELSE 0 END, mt.meeting_date DESC, mt.id DESC`,
   ).all();
@@ -339,12 +388,13 @@ async function loadMeeting(env: Env, id: number) {
   return m;
 }
 
+// Candidates for an open meeting are the whole suggestion pool.
 async function selectionInput(env: Env, meetingId: number) {
   const [cands, members, rankings, approvals] = await env.DB.batch([
     env.DB.prepare(
       `SELECT b.id AS bookId, b.title, (SELECT COUNT(*) FROM read_before rb WHERE rb.book_id = b.id) AS readCount
-       FROM suggestions s JOIN books b ON b.id = s.book_id WHERE s.meeting_id = ? ORDER BY s.created_at`,
-    ).bind(meetingId),
+       FROM books b WHERE b.in_pool = 1 ORDER BY b.created_at`,
+    ),
     env.DB.prepare('SELECT COUNT(*) AS n FROM members'),
     env.DB.prepare('SELECT member_id AS memberId, book_id AS bookId, position FROM rankings WHERE meeting_id = ?').bind(meetingId),
     env.DB.prepare('SELECT member_id AS memberId, book_id AS bookId FROM approvals WHERE meeting_id = ?').bind(meetingId),
@@ -362,16 +412,18 @@ app.get('/api/meetings/:id', async (c) => {
   const id = intParam(c.req.param('id'));
   const me = c.get('member').id;
   const meeting = await loadMeeting(c.env, id);
-  const [suggestions, methodVotes, myRanking, myApprovals, voters] = await c.env.DB.batch([
-    c.env.DB.prepare(
-      `SELECT s.book_id, s.pitch, s.member_id, m.name AS suggested_by, b.title, b.authors, b.cover_url, b.published,
+  const bookCols = `b.id AS book_id, b.pitch, b.suggested_by, b.title, b.authors, b.cover_url, b.published,
          b.page_count, b.description,
          (SELECT COUNT(*) FROM read_before rb WHERE rb.book_id = b.id) AS read_count,
          (SELECT GROUP_CONCAT(m2.name, ', ') FROM read_before rb JOIN members m2 ON m2.id = rb.member_id WHERE rb.book_id = b.id) AS read_by,
-         EXISTS (SELECT 1 FROM read_before rb WHERE rb.book_id = b.id AND rb.member_id = ?) AS read_by_me
-       FROM suggestions s JOIN books b ON b.id = s.book_id LEFT JOIN members m ON m.id = s.member_id
-       WHERE s.meeting_id = ? ORDER BY s.created_at`,
-    ).bind(me, id),
+         EXISTS (SELECT 1 FROM read_before rb WHERE rb.book_id = b.id AND rb.member_id = ?) AS read_by_me`;
+  const [suggestions, methodVotes, myRanking, myApprovals, voters] = await c.env.DB.batch([
+    // Open meetings choose from the suggestion pool; decided ones keep a snapshot of what was on the ballot.
+    meeting.status === 'decided'
+      ? c.env.DB.prepare(
+          `SELECT ${bookCols} FROM suggestions s JOIN books b ON b.id = s.book_id WHERE s.meeting_id = ? ORDER BY s.created_at`,
+        ).bind(me, id)
+      : c.env.DB.prepare(`SELECT ${bookCols} FROM books b WHERE b.in_pool = 1 ORDER BY b.created_at`).bind(me),
     c.env.DB.prepare(
       'SELECT mv.method, mv.member_id, m.name FROM method_votes mv JOIN members m ON m.id = mv.member_id WHERE mv.meeting_id = ?',
     ).bind(id),
@@ -423,14 +475,21 @@ app.patch('/api/meetings/:id', async (c) => {
     if (status !== 'suggesting' && status !== 'voting') throw new HttpError(400, 'Use "Pick the book" to decide');
     fields.push(['status', status]);
     if (meeting.status === 'decided') {
-      // Re-opening a decided meeting clears the result.
+      // Re-opening a decided meeting clears the result and puts the pick back in the pool.
       fields.push(['chosen_book_id', null], ['result_json', null], ['method', null]);
     }
   }
   if (!fields.length) return c.json({ ok: true });
-  await c.env.DB.prepare(`UPDATE meetings SET ${fields.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ?`)
-    .bind(...fields.map(([, v]) => v), id)
-    .run();
+  const reopening = meeting.status === 'decided' && 'status' in body;
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE meetings SET ${fields.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ?`).bind(...fields.map(([, v]) => v), id),
+    ...(reopening
+      ? [
+          c.env.DB.prepare('UPDATE books SET in_pool = 1 WHERE id = ?').bind(meeting.chosen_book_id),
+          c.env.DB.prepare('DELETE FROM suggestions WHERE meeting_id = ?').bind(id),
+        ]
+      : []),
+  ]);
   return c.json({ ok: true });
 });
 
@@ -441,43 +500,6 @@ app.delete('/api/meetings/:id', async (c) => {
     throw new HttpError(403, 'Only the person who created this meeting can delete it');
   }
   await c.env.DB.prepare('DELETE FROM meetings WHERE id = ?').bind(id).run();
-  return c.json({ ok: true });
-});
-
-app.post('/api/meetings/:id/suggestions', async (c) => {
-  const id = intParam(c.req.param('id'));
-  const meeting = await loadMeeting(c.env, id);
-  if (meeting.status === 'decided') throw new HttpError(409, 'This meeting has already picked its book');
-  const body = await c.req.json<{ bookId?: number; pitch?: string }>();
-  const bookId = intParam(String(body.bookId));
-  await loadBook(c.env, bookId);
-  const res = await c.env.DB.prepare(
-    'INSERT OR IGNORE INTO suggestions (meeting_id, book_id, member_id, pitch) VALUES (?, ?, ?, ?)',
-  )
-    .bind(id, bookId, c.get('member').id, text(body.pitch, 1000))
-    .run();
-  if (!res.meta.changes) throw new HttpError(409, 'That book has already been suggested for this meeting');
-  return c.json({ ok: true });
-});
-
-app.delete('/api/meetings/:id/suggestions/:bookId', async (c) => {
-  const id = intParam(c.req.param('id'));
-  const bookId = intParam(c.req.param('bookId'));
-  const meeting = await loadMeeting(c.env, id);
-  if (meeting.status === 'decided') throw new HttpError(409, 'This meeting has already picked its book');
-  const s = await c.env.DB.prepare('SELECT member_id FROM suggestions WHERE meeting_id = ? AND book_id = ?')
-    .bind(id, bookId)
-    .first<{ member_id: number | null }>();
-  if (!s) throw new HttpError(404, 'Suggestion not found');
-  const me = c.get('member').id;
-  if (s.member_id && s.member_id !== me && meeting.created_by !== me) {
-    throw new HttpError(403, 'Only whoever suggested it (or the meeting host) can remove it');
-  }
-  await c.env.DB.batch([
-    c.env.DB.prepare('DELETE FROM suggestions WHERE meeting_id = ? AND book_id = ?').bind(id, bookId),
-    c.env.DB.prepare('DELETE FROM rankings WHERE meeting_id = ? AND book_id = ?').bind(id, bookId),
-    c.env.DB.prepare('DELETE FROM approvals WHERE meeting_id = ? AND book_id = ?').bind(id, bookId),
-  ]);
   return c.json({ ok: true });
 });
 
@@ -501,8 +523,8 @@ app.put('/api/meetings/:id/method', async (c) => {
   return c.json({ ok: true });
 });
 
-async function suggestedIds(env: Env, meetingId: number): Promise<Set<number>> {
-  const { results } = await env.DB.prepare('SELECT book_id FROM suggestions WHERE meeting_id = ?').bind(meetingId).all<{ book_id: number }>();
+async function poolIds(env: Env): Promise<Set<number>> {
+  const { results } = await env.DB.prepare('SELECT id AS book_id FROM books WHERE in_pool = 1').all<{ book_id: number }>();
   return new Set(results.map((r) => r.book_id));
 }
 
@@ -511,9 +533,9 @@ async function parseBallot(c: any, id: number): Promise<number[]> {
   if (meeting.status === 'decided') throw new HttpError(409, 'Voting has closed for this meeting');
   const { bookIds } = await c.req.json();
   if (!Array.isArray(bookIds)) throw new HttpError(400, 'bookIds must be a list');
-  const valid = await suggestedIds(c.env, id);
+  const valid = await poolIds(c.env);
   const ids = [...new Set(bookIds.map(Number))];
-  if (ids.some((b) => !valid.has(b))) throw new HttpError(400, 'Ballot includes a book that is not suggested for this meeting');
+  if (ids.some((b) => !valid.has(b))) throw new HttpError(400, 'Ballot includes a book that is no longer in the suggestions');
   return ids;
 }
 
@@ -557,11 +579,19 @@ app.post('/api/meetings/:id/decide', async (c) => {
   const input = await selectionInput(c.env, id);
   if (input.candidates.length === 0) throw new HttpError(400, 'Suggest at least one book first');
   const result = select(method, input);
-  await c.env.DB.prepare(
-    "UPDATE meetings SET status = 'decided', method = ?, chosen_book_id = ?, result_json = ? WHERE id = ?",
-  )
-    .bind(method, result.winnerBookId, JSON.stringify({ ...result, decidedBy: c.get('member').name, decidedAt: new Date().toISOString() }), id)
-    .run();
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM suggestions WHERE meeting_id = ?').bind(id),
+    c.env.DB.prepare(
+      'INSERT INTO suggestions (meeting_id, book_id, member_id, pitch) SELECT ?, id, added_by, pitch FROM books WHERE in_pool = 1',
+    ).bind(id),
+    c.env.DB.prepare('UPDATE books SET in_pool = 0 WHERE id = ?').bind(result.winnerBookId),
+    c.env.DB.prepare("UPDATE meetings SET status = 'decided', method = ?, chosen_book_id = ?, result_json = ? WHERE id = ?").bind(
+      method,
+      result.winnerBookId,
+      JSON.stringify({ ...result, decidedBy: c.get('member').name, decidedAt: new Date().toISOString() }),
+      id,
+    ),
+  ]);
   return c.json({ result });
 });
 
