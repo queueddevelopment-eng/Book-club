@@ -27,6 +27,7 @@ function checkVersion(res) {
 async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(`/api${path}`, {
     method,
+    cache: 'no-store',
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -500,8 +501,11 @@ function bindBookCards({ afterDelete = refresh } = {}) {
     '[data-delete-book]',
     'click',
     action(async (e) => {
+      const btn = e.currentTarget;
       if (!confirm('Remove this book from the suggestions? Any votes for it will be dropped.')) return;
-      await api(`/books/${e.currentTarget.dataset.deleteBook}`, { method: 'DELETE' });
+      await api(`/books/${btn.dataset.deleteBook}`, { method: 'DELETE' });
+      // Take the card off the page right away; the refresh below updates counts and standings.
+      btn.closest('.book-card')?.remove();
       toast('Suggestion removed');
       await afterDelete();
     }),

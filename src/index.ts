@@ -13,6 +13,8 @@ app.use('/api/*', async (c, next) => {
   await next();
   const version = c.env.CF_VERSION_METADATA?.id;
   if (version) c.header('X-App-Version', version);
+  // API data changes constantly; never let a browser answer from a stale copy.
+  c.header('Cache-Control', 'no-store');
 });
 
 class HttpError extends Error {
