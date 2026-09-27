@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { hashPin, randomToken, requireMember, SESSION_COOKIE, timingSafeEqual } from './auth';
+import { checkAvailability, findLibraries, getLibrary, LIBRARY_KEY_RE, searchUrl } from './libby';
 import { getBookDetails, searchBooks, storeLinks } from './metadata';
 import { METHODS, resolveMethod, select, type Method } from './selection';
 import { generateTalkingPoints } from './talking-points';
@@ -107,9 +108,62 @@ app.use('/api/*', requireMember);
 
 app.get('/api/me', (c) => c.json({ member: c.get('member') }));
 
+// ---------------------------------------------------------------- libby
+
+app.get('/api/libraries', async (c) => {
+  const q = text(c.req.query('q'), 100);
+  if (!q) return c.json({ libraries: [] });
+  return c.json({ libraries: await findLibraries(q) });
+});
+
+app.put('/api/me/library', async (c) => {
+  const body = await c.req.json<{ key?: string | null; name?: string }>();
+  const me = c.get('member');
+  if (!body.key) {
+    await c.env.DB.prepare('UPDATE members SET libby_key = NULL, libby_name = NULL WHERE id = ?').bind(me.id).run();
+    return c.json({ library: null });
+  }
+  const key = body.key.trim().toLowerCase();
+  if (!LIBRARY_KEY_RE.test(key)) throw new HttpError(400, 'That doesn’t look like a Libby library key');
+  // Confirm the library exists; if OverDrive can't be reached, trust a name picked from search.
+  const library = (await getLibrary(key)) ?? (text(body.name, 200) ? { key, name: text(body.name, 200)! } : null);
+  if (!library) throw new HttpError(404, 'Couldn’t confirm that library key with Libby. Check it, or find your library by name instead.');
+  await c.env.DB.prepare('UPDATE members SET libby_key = ?, libby_name = ? WHERE id = ?').bind(library.key, library.name, me.id).run();
+  return c.json({ library });
+});
+
+/**
+ * Libby availability for a book. scope=mine checks only the viewer's library (used on
+ * suggestion cards); otherwise every library the club's members use.
+ */
+app.get('/api/books/:id/libby', async (c) => {
+  const id = intParam(c.req.param('id'));
+  const book = await loadBook(c.env, id);
+  const me = c.get('member');
+  let libraries: { key: string; name: string; members: string[] }[];
+  if (c.req.query('scope') === 'mine') {
+    libraries = me.libby_key ? [{ key: me.libby_key, name: me.libby_name ?? me.libby_key, members: [me.name] }] : [];
+  } else {
+    const { results } = await c.env.DB.prepare(
+      `SELECT libby_key AS key, MAX(libby_name) AS name, GROUP_CONCAT(name, ', ') AS members
+       FROM members WHERE libby_key IS NOT NULL GROUP BY libby_key ORDER BY COUNT(*) DESC LIMIT 8`,
+    ).all<{ key: string; name: string; members: string }>();
+    libraries = results.map((r) => ({ ...r, members: r.members.split(', ') }));
+  }
+  const checked = await Promise.all(
+    libraries.map(async (lib) => ({
+      library: { key: lib.key, name: lib.name },
+      members: lib.members,
+      formats: await checkAvailability(lib.key, book.title, book.authors),
+      searchUrl: searchUrl(lib.key, book.title, book.authors),
+    })),
+  );
+  return c.json({ libraries: checked });
+});
+
 app.get('/api/members', async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT m.id, m.name, m.created_at,
+    `SELECT m.id, m.name, m.created_at, m.libby_name,
        (SELECT COUNT(*) FROM reviews r WHERE r.member_id = m.id) AS review_count,
        (SELECT COUNT(*) FROM books b WHERE b.suggested_by = m.name COLLATE NOCASE) AS suggestion_count
      FROM members m ORDER BY m.name`,
@@ -240,6 +294,7 @@ app.get('/api/books/:id', async (c) => {
       club_pick: meetings.results.some((m: any) => m.chosen),
       audible_link: book.audible_url || links.audible,
       kindle_link: book.kindle_url || links.kindle,
+      libby_link: searchUrl(me.libby_key, book.title, book.authors),
     },
     reviews: reviews.results,
     progress: progress.results,

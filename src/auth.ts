@@ -37,10 +37,10 @@ export async function requireMember(c: Context<AppEnv>, next: Next) {
   const token = getCookie(c, SESSION_COOKIE);
   if (token) {
     const member = await c.env.DB.prepare(
-      'SELECT m.id, m.name FROM sessions s JOIN members m ON m.id = s.member_id WHERE s.token = ?',
+      'SELECT m.id, m.name, m.libby_key, m.libby_name FROM sessions s JOIN members m ON m.id = s.member_id WHERE s.token = ?',
     )
       .bind(token)
-      .first<{ id: number; name: string }>();
+      .first<AppEnv['Variables']['member']>();
     if (member) {
       c.set('member', member);
       return next();

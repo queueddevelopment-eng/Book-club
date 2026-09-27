@@ -14,5 +14,5 @@ export interface Env {
 
 export interface AppEnv {
   Bindings: Env;
-  Variables: { member: { id: number; name: string } };
+  Variables: { member: { id: number; name: string; libby_key: string | null; libby_name: string | null } };
 }

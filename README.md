@@ -25,6 +25,11 @@ It runs entirely on Cloudflare: a Worker serves the API and the static frontend,
   its score. Set it to `0` to turn this off, or `1` to rule those books out completely.
 - **Audible and Kindle links** on every book. By default they open a store search. You can paste an
   exact product link instead.
+- **Libby (free library loans)**: each member picks their library once, either by searching by
+  name, city or ZIP, or by entering its Libby key. Book pages then get a *Find on Libby* button and
+  a table of ebook and audiobook availability at every library the club uses: copies, holds, the
+  estimated wait, and a borrow or hold link. While a meeting is choosing, each suggestion shows the
+  wait at your own library. Results are cached for an hour.
 - **Reading progress**: everyone's % complete and format (print, Kindle or Audible), visible to the
   whole club on the home page and the book page.
 - **Reviews**: 1–5 stars and an optional write-up.
@@ -39,6 +44,14 @@ Amazon doesn't offer a public API for Kindle or Audible reading progress, and sc
 storing members' Amazon passwords, so the app doesn't connect to those accounts. Instead, members
 log their own % (the Kindle progress bar and Audible's "time left" make this quick). If Amazon ever
 opens an API, `PUT /api/books/:id/progress` is the hook to feed it into.
+
+### About Libby wait times
+
+Availability comes from the same public endpoints the Libby app uses (`thunder.api.overdrive.com`
+and `locate.libbyapp.com`). No key is needed, but OverDrive doesn't officially document or support
+these endpoints, so they could change without notice. If a lookup fails, the app says so and links
+to a Libby search instead. When Libby doesn't return its own wait estimate, the app estimates one
+assuming 14-day loans.
 
 ## Deploying to Cloudflare
 
@@ -121,6 +134,7 @@ The Workers AI binding always talks to Cloudflare, even in local dev, so `npm ru
 ```
 src/index.ts           API routes (Hono)
 src/selection.ts       Borda / approval / weighted-random selection and the read penalty
+src/libby.ts           Libby library search, availability and wait times
 src/metadata.ts        Google Books, Open Library and Wikipedia lookups; store links
 src/talking-points.ts  Claude (structured output) and Workers AI generation
 src/auth.ts            PIN hashing and session middleware

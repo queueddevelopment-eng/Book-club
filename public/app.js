@@ -107,6 +107,90 @@ const METHOD_INFO = {
 };
 const FORMAT_LABEL = { print: '📖 Print', kindle: '📱 Kindle', audible: '🎧 Audible', other: 'Other' };
 
+// ------------------------------------------------------------ libby
+
+function fmtWait(f) {
+  if (f.isAvailable) return 'Available now';
+  if (f.estimatedWaitDays == null) return `${f.holdsCount} on hold`;
+  const d = f.estimatedWaitDays;
+  return d < 14 ? `~${d} day${d === 1 ? '' : 's'}` : d < 60 ? `~${Math.round(d / 7)} weeks` : `~${Math.round(d / 30)} months`;
+}
+
+const FORMAT_ICON = { ebook: '📱 Ebook', audiobook: '🎧 Audiobook' };
+
+/** Short badge for suggestion cards: the viewer's library only. */
+function libbyBadge(formats) {
+  if (!formats) return '<span class="muted">Libby: couldn’t check</span>';
+  if (!formats.length) return '<span class="muted">Libby: not at your library</span>';
+  return formats
+    .map((f) => `<span class="pill ${f.isAvailable ? 'good' : f.estimatedWaitDays > 42 ? 'warn' : ''}">${f.format === 'ebook' ? '📱' : '🎧'} ${esc(fmtWait(f))}</span>`)
+    .join(' ');
+}
+
+function libbyTable(libraries) {
+  if (!libraries.length) return '<p class="muted small">Nobody in the club has set a Libby library yet.</p>';
+  return libraries
+    .map(
+      (l) => `
+      <div class="card flat" style="margin-bottom:8px">
+        <div class="row spread"><strong>${esc(l.library.name)}</strong>
+          <span class="small muted">${esc(l.members.join(', '))}</span></div>
+        ${
+          l.formats == null
+            ? `<p class="small muted">Couldn’t reach Libby. <a href="${esc(l.searchUrl)}" target="_blank" rel="noopener">Search there directly</a>.</p>`
+            : !l.formats.length
+              ? `<p class="small muted">Not in this library’s Libby collection. <a href="${esc(l.searchUrl)}" target="_blank" rel="noopener">Search anyway</a> (it may be under another title).</p>`
+              : `<table style="margin-top:6px"><thead><tr><th>Format</th><th>Copies</th><th>Holds</th><th>Wait</th><th></th></tr></thead><tbody>${l.formats
+                  .map(
+                    (f) => `<tr><td>${FORMAT_ICON[f.format]}</td><td>${f.availableCopies}/${f.ownedCopies}</td><td>${f.holdsCount}</td>
+                      <td><span class="pill ${f.isAvailable ? 'good' : ''}">${esc(fmtWait(f))}</span></td>
+                      <td><a href="${esc(f.url)}" target="_blank" rel="noopener">${f.isAvailable ? 'Borrow' : 'Place hold'} →</a></td></tr>`,
+                  )
+                  .join('')}</tbody></table>`
+        }
+      </div>`,
+    )
+    .join('');
+}
+
+/** Lets the member search for and save their Libby library. */
+function libraryPicker(container, onSaved) {
+  container.innerHTML = `
+    <form class="row lib-search">
+      <input type="search" placeholder="Library name, city or ZIP code" style="flex:1;min-width:200px" required />
+      <button type="submit">Find</button>
+    </form>
+    <div class="lib-results stack small" style="margin-top:8px"></div>
+    <details class="small" style="margin-top:8px"><summary class="muted">Or enter your library’s Libby key</summary>
+      <p class="muted" style="margin:6px 0">Open your library in Libby on the web — it’s the part after <code>libbyapp.com/library/</code>.</p>
+      <form class="row lib-key"><input placeholder="e.g. lapl" style="flex:1;min-width:120px" required /><button type="submit">Save</button></form>
+    </details>`;
+  const save = async (key, name) => {
+    const { library } = await api('/me/library', { method: 'PUT', body: { key, name } });
+    me = { ...me, libby_key: library?.key ?? null, libby_name: library?.name ?? null };
+    toast(library ? `Library set to ${library.name}` : 'Library removed');
+    await onSaved();
+  };
+  $('.lib-search', container).addEventListener(
+    'submit',
+    action(async () => {
+      const results = $('.lib-results', container);
+      results.innerHTML = '<span class="muted">Searching…</span>';
+      const { libraries } = await api(`/libraries?q=${encodeURIComponent($('.lib-search input', container).value)}`);
+      results.innerHTML = libraries.length
+        ? libraries.map((l, i) => `<div class="row spread"><span>${esc(l.name)} <span class="muted">(${esc(l.key)})</span></span><button class="small" data-lib="${i}">Choose</button></div>`).join('')
+        : '<span class="muted">No Libby libraries found. Try your city, or enter the key below.</span>';
+      $$('[data-lib]', results).forEach((b) =>
+        b.addEventListener('click', action(() => save(libraries[b.dataset.lib].key, libraries[b.dataset.lib].name))),
+      );
+    }),
+  );
+  $('.lib-key', container).addEventListener(
+    'submit',
+    action(() => save($('.lib-key input', container).value, null)),
+  );
+}
+
 // ------------------------------------------------------------ router
 
 const routes = [
@@ -184,7 +268,7 @@ function renderLogin() {
         method: 'POST',
         body: { name: $('#name').value, pin: $('#pin').value, passcode: $('#passcode')?.value },
       });
-      setMe(data.member);
+      setMe((await api('/me')).member ?? data.member);
       location.hash = '#/';
     }),
   );
@@ -457,6 +541,7 @@ function bookCard(b, { editable = true } = {}) {
       <div class="small">Suggested by: <strong>${esc(b.suggested_by || 'unknown')}</strong></div>
       ${b.pitch ? `<div class="small">“${esc(b.pitch)}”</div>` : ''}
       ${b.read_count ? `<div class="small"><span class="pill warn">Already read by ${esc(b.read_by)}</span></div>` : ''}
+      ${editable && me.libby_key ? `<div class="small" data-libby="${id}"><span class="muted">Libby: checking…</span></div>` : ''}
       ${
         editable
           ? `<label class="row small" style="font-weight:400;gap:6px;margin:0">
@@ -471,6 +556,15 @@ function bookCard(b, { editable = true } = {}) {
 
 /** Wires up the read toggles and edit forms rendered by bookCard / editBookForm. */
 function bindBookCards({ afterDelete = refresh } = {}) {
+  // Libby wait times at the viewer's library, filled in as they arrive
+  $$('[data-libby]').forEach(async (el) => {
+    try {
+      const { libraries } = await api(`/books/${el.dataset.libby}/libby?scope=mine`);
+      el.innerHTML = libbyBadge(libraries[0]?.formats ?? null);
+    } catch {
+      el.innerHTML = libbyBadge(null);
+    }
+  });
   on(
     '[data-read]',
     'change',
@@ -845,6 +939,11 @@ async function renderBook(id) {
         ${cover(book)}
         <a class="button" style="width:100%" href="${esc(book.audible_link)}" target="_blank" rel="noopener">🎧 Find on Audible</a>
         <a class="button" style="width:100%" href="${esc(book.kindle_link)}" target="_blank" rel="noopener">📱 Find on Kindle</a>
+        ${
+          me.libby_key
+            ? `<a class="button" style="width:100%" href="${esc(book.libby_link)}" target="_blank" rel="noopener">📚 Find on Libby</a>`
+            : `<button class="button" style="width:100%" id="goto-libby">📚 Find on Libby</button>`
+        }
         <button class="link small" id="edit-links">Set exact store links</button>
         <form id="links-form" class="stack small" hidden>
           <input id="l-aud" placeholder="https://www.audible.com/pd/…" value="${esc(book.audible_url ?? '')}" />
@@ -881,6 +980,14 @@ async function renderBook(id) {
                <p class="prose" style="margin:0">${esc(book.author_bio)}</p></div>`
             : ''
         }
+
+        <h2 id="libby">Borrow from the library (Libby)</h2>
+        <div id="libby-box"><p class="muted small">Checking Libby…</p></div>
+        ${me.libby_key ? `<p class="small muted">Your library: ${esc(me.libby_name)} · <button class="link small" id="change-lib">change</button></p>` : ''}
+        <div id="lib-picker" ${me.libby_key ? 'hidden' : ''}>
+          ${me.libby_key ? '' : '<p class="small" style="margin-top:0">Set your library to see wait times and get a direct Libby link:</p>'}
+          <div id="lib-picker-body"></div>
+        </div>
 
         <h2>Reading progress</h2>
         ${progressList(progress)}
@@ -954,6 +1061,20 @@ async function renderBook(id) {
     }),
   );
   bindTalkingPoints(id);
+
+  libraryPicker($('#lib-picker-body'), refresh);
+  on('#goto-libby', 'click', () => {
+    $('#libby').scrollIntoView({ behavior: 'smooth' });
+    $('#lib-picker input')?.focus({ preventScroll: true });
+  });
+  on('#change-lib', 'click', () => ($('#lib-picker').hidden = !$('#lib-picker').hidden));
+  api(`/books/${id}/libby`)
+    .then(({ libraries }) => {
+      if ($('#libby-box')) $('#libby-box').innerHTML = libbyTable(libraries);
+    })
+    .catch(() => {
+      if ($('#libby-box')) $('#libby-box').innerHTML = '<p class="muted small">Couldn’t check Libby right now.</p>';
+    });
 }
 
 function talkingPointsHtml(tp) {
@@ -1040,13 +1161,32 @@ async function renderMembers() {
   app.innerHTML = `
     <h1>Members</h1>
     <div class="card"><table>
-      <thead><tr><th>Name</th><th>Suggestions</th><th>Reviews</th><th>Joined</th></tr></thead>
+      <thead><tr><th>Name</th><th>Library</th><th>Suggestions</th><th>Reviews</th><th>Joined</th></tr></thead>
       <tbody>${members
         .map((m) => `<tr><td><strong>${esc(m.name)}</strong>${m.id === me.id ? ' <span class="pill">you</span>' : ''}</td>
-          <td>${m.suggestion_count}</td><td>${m.review_count}</td><td class="muted small">${esc(m.created_at.slice(0, 10))}</td></tr>`)
+          <td class="small">${esc(m.libby_name ?? '—')}</td><td>${m.suggestion_count}</td><td>${m.review_count}</td><td class="muted small">${esc(m.created_at.slice(0, 10))}</td></tr>`)
         .join('')}</tbody>
     </table></div>
-    <p class="muted small">Invite friends by sending them this site’s address${config.passcodeRequired ? ' and the club passcode' : ''}.</p>`;
+    <p class="muted small">Invite friends by sending them this site’s address${config.passcodeRequired ? ' and the club passcode' : ''}.</p>
+    <h2>Your Libby library</h2>
+    <div class="card stack">
+      <p style="margin:0">${
+        me.libby_key
+          ? `Currently <strong>${esc(me.libby_name)}</strong> · <button class="link" id="clear-lib">remove</button>`
+          : 'Borrow ebooks and audiobooks free with a library card. Set your library to see wait times on suggestions.'
+      }</p>
+      <div id="lib-picker-body"></div>
+    </div>`;
+  libraryPicker($('#lib-picker-body'), refresh);
+  on(
+    '#clear-lib',
+    'click',
+    action(async () => {
+      await api('/me/library', { method: 'PUT', body: { key: null } });
+      me = { ...me, libby_key: null, libby_name: null };
+      await refresh();
+    }),
+  );
 }
 
 // ------------------------------------------------------------ boot
