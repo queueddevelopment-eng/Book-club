@@ -165,7 +165,8 @@ app.get('/api/members', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT m.id, m.name, m.created_at, m.libby_name,
        (SELECT COUNT(*) FROM reviews r WHERE r.member_id = m.id) AS review_count,
-       (SELECT COUNT(*) FROM books b WHERE b.suggested_by = m.name COLLATE NOCASE) AS suggestion_count
+       (SELECT COUNT(*) FROM books b WHERE b.suggested_by = m.name COLLATE NOCASE) AS suggestion_count,
+       (SELECT COUNT(*) FROM shelf_posts sp WHERE sp.member_id = m.id) AS shelf_count
      FROM members m ORDER BY m.name`,
   ).all();
   return c.json({ members: results });
@@ -657,6 +658,118 @@ app.post('/api/meetings/:id/decide', async (c) => {
     ),
   ]);
   return c.json({ result });
+});
+
+// ---------------------------------------------------------------- shelves
+
+const SHELF_STATUSES = ['reading', 'finished', 'abandoned'];
+
+function shelfFields(body: Record<string, unknown>, partial: boolean): [string, unknown][] {
+  const fields: [string, unknown][] = [];
+  if (!partial || 'status' in body) {
+    if (!SHELF_STATUSES.includes(String(body.status))) throw new HttpError(400, 'Pick reading, finished or gave up');
+    fields.push(['status', body.status]);
+  }
+  if (!partial || 'rating' in body) {
+    const r = body.rating == null || body.rating === '' ? null : Number(body.rating);
+    if (r !== null && (!Number.isInteger(r) || r < 1 || r > 5)) throw new HttpError(400, 'Rating must be 1–5 stars');
+    fields.push(['rating', r]);
+  }
+  if (!partial || 'body' in body) fields.push(['body', text(body.body, 10000)]);
+  return fields;
+}
+
+async function loadPost(c: { env: Env; get: (k: 'member') => { id: number } }, id: number, mustOwn: boolean) {
+  const post = await c.env.DB.prepare('SELECT * FROM shelf_posts WHERE id = ?').bind(id).first<Record<string, any>>();
+  if (!post) throw new HttpError(404, 'Post not found');
+  if (mustOwn && post.member_id !== c.get('member').id) throw new HttpError(403, 'Only the person who posted this can change it');
+  return post;
+}
+
+app.get('/api/shelf', async (c) => {
+  const member = c.req.query('member');
+  const limit = Math.min(100, Math.max(1, Number(c.req.query('limit')) || 50));
+  const where = member ? 'WHERE p.member_id = ?' : '';
+  const stmt = c.env.DB.prepare(
+    `SELECT p.*, m.name AS member_name,
+       (SELECT COUNT(*) FROM shelf_comments sc WHERE sc.post_id = p.id) AS comment_count,
+       (SELECT id FROM books b WHERE b.in_pool = 1 AND (b.source_id = p.source_id OR b.title = p.title COLLATE NOCASE) LIMIT 1) AS pool_book_id
+     FROM shelf_posts p JOIN members m ON m.id = p.member_id ${where}
+     ORDER BY p.updated_at DESC, p.id DESC LIMIT ${limit}`,
+  );
+  const { results } = await (member ? stmt.bind(intParam(member)) : stmt).all();
+  return c.json({ posts: results });
+});
+
+app.post('/api/shelf', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>();
+  const title = text(body.title, 300);
+  if (!title) throw new HttpError(400, 'Which book? Search for it or type the title');
+  const cover = text(body.cover_url, 1000);
+  const sourceId = text(body.source_id, 200);
+  if (sourceId && !/^(google:[\w-]+|ol:\/works\/OL\w+)$/.test(sourceId)) throw new HttpError(400, 'Unknown book id');
+  const fields: [string, unknown][] = [
+    ['member_id', c.get('member').id],
+    ['title', title],
+    ['authors', text(body.authors, 300) ?? ''],
+    ['cover_url', cover && /^https:\/\//.test(cover) ? cover : null],
+    ['published', text(body.published, 40)],
+    ['source_id', sourceId],
+    ...shelfFields(body, false),
+  ];
+  const row = await c.env.DB.prepare(
+    `INSERT INTO shelf_posts (${fields.map(([k]) => k).join(', ')}) VALUES (${fields.map(() => '?').join(', ')}) RETURNING id`,
+  )
+    .bind(...fields.map(([, v]) => v))
+    .first<{ id: number }>();
+  return c.json({ id: row!.id });
+});
+
+app.patch('/api/shelf/:id', async (c) => {
+  const id = intParam(c.req.param('id'));
+  await loadPost(c, id, true);
+  const fields = shelfFields(await c.req.json<Record<string, unknown>>(), true);
+  if (!fields.length) return c.json({ ok: true });
+  await c.env.DB.prepare(`UPDATE shelf_posts SET ${fields.map(([k]) => `${k} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`)
+    .bind(...fields.map(([, v]) => v), id)
+    .run();
+  return c.json({ ok: true });
+});
+
+app.delete('/api/shelf/:id', async (c) => {
+  const id = intParam(c.req.param('id'));
+  await loadPost(c, id, true);
+  await c.env.DB.prepare('DELETE FROM shelf_posts WHERE id = ?').bind(id).run();
+  return c.json({ ok: true });
+});
+
+app.get('/api/shelf/:id/comments', async (c) => {
+  const id = intParam(c.req.param('id'));
+  await loadPost(c, id, false);
+  const { results } = await c.env.DB.prepare(
+    `SELECT sc.id, sc.member_id, m.name, sc.body, sc.created_at FROM shelf_comments sc JOIN members m ON m.id = sc.member_id
+     WHERE sc.post_id = ? ORDER BY sc.created_at, sc.id`,
+  )
+    .bind(id)
+    .all();
+  return c.json({ comments: results });
+});
+
+app.post('/api/shelf/:id/comments', async (c) => {
+  const id = intParam(c.req.param('id'));
+  await loadPost(c, id, false);
+  const { body } = await c.req.json<{ body?: string }>();
+  const t = text(body, 2000);
+  if (!t) throw new HttpError(400, 'Write something first');
+  await c.env.DB.prepare('INSERT INTO shelf_comments (post_id, member_id, body) VALUES (?, ?, ?)').bind(id, c.get('member').id, t).run();
+  return c.json({ ok: true });
+});
+
+app.delete('/api/shelf/comments/:commentId', async (c) => {
+  const id = intParam(c.req.param('commentId'));
+  const res = await c.env.DB.prepare('DELETE FROM shelf_comments WHERE id = ? AND member_id = ?').bind(id, c.get('member').id).run();
+  if (!res.meta.changes) throw new HttpError(404, 'Comment not found');
+  return c.json({ ok: true });
 });
 
 app.all('/api/*', (c) => c.json({ error: 'Not found' }, 404));

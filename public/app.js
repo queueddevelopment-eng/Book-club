@@ -198,6 +198,8 @@ const routes = [
   [/^#\/?$/, renderHome],
   [/^#\/library$/, renderLibrary],
   [/^#\/members$/, renderMembers],
+  [/^#\/shelves$/, () => renderShelves()],
+  [/^#\/shelves\/(\d+)$/, (id) => renderShelves(Number(id))],
   [/^#\/meetings\/(\d+)$/, renderMeeting],
   [/^#\/books\/(\d+)$/, renderBook],
 ];
@@ -328,7 +330,20 @@ async function renderHome() {
     ${open.length ? `<div class="grid">${open.map(meetingCard).join('')}</div>` : `<div class="card flat empty">No meetings are collecting suggestions. Start one with “New meeting”.</div>`}
     ${upcoming.length ? `<h2>Coming up</h2><div class="grid">${upcoming.map(meetingCard).join('')}</div>` : ''}
     ${past.length ? `<h2>Past meetings</h2><div class="grid">${past.map(meetingCard).join('')}</div>` : ''}
+    <div class="row spread"><h2>From members’ shelves</h2><a href="#/shelves" class="small">All posts →</a></div>
+    <div id="home-shelf"><p class="muted small">Loading…</p></div>
   `;
+  api('/shelf?limit=4')
+    .then(({ posts }) => {
+      const box = $('#home-shelf');
+      if (!box) return;
+      shelfCache = new Map(posts.map((p) => [p.id, p]));
+      box.innerHTML = posts.length
+        ? `<div class="stack">${posts.map((p) => shelfPost(p, { compact: true })).join('')}</div>`
+        : `<div class="card flat empty">Nobody has posted yet. Share what you’re reading on the <a href="#/shelves">Shelves</a> page.</div>`;
+      bindShelfPosts();
+    })
+    .catch(() => {});
 
   on('#new-meeting', 'click', () => {
     $('#meeting-form').hidden = false;
@@ -417,7 +432,11 @@ function bindProgressForm(bookId) {
  * Renders a search box that looks books up via Google Books / Open Library.
  * onPick receives the saved book's id.
  */
-function bookSearch(container, { onPick, cta = 'Add', extra = () => ({}) }) {
+/**
+ * With onSelect instead of onPick, the chosen result (or the manual title/author) is handed back
+ * as-is and nothing is added to the club's books.
+ */
+function bookSearch(container, { onPick, onSelect, cta = 'Add', extra = () => ({}) }) {
   container.innerHTML = `
     <form class="row search-form">
       <input type="search" placeholder="Search by title, author or ISBN…" style="flex:1;min-width:200px" required />
@@ -461,6 +480,7 @@ function bookSearch(container, { onPick, cta = 'Add', extra = () => ({}) }) {
         btn.addEventListener(
           'click',
           action(async (e) => {
+            if (onSelect) return onSelect(items[Number(e.currentTarget.dataset.i)]);
             btn.textContent = 'Fetching details…';
             const { id } = await api('/books', { method: 'POST', body: { sourceId: items[Number(e.currentTarget.dataset.i)].sourceId, ...extra() } });
             await onPick(id);
@@ -473,6 +493,7 @@ function bookSearch(container, { onPick, cta = 'Add', extra = () => ({}) }) {
     'submit',
     action(async (e) => {
       const f = new FormData(e.target);
+      if (onSelect) return onSelect({ title: f.get('title'), authors: f.get('authors') ? [f.get('authors')] : [] });
       const { id } = await api('/books', { method: 'POST', body: { title: f.get('title'), authors: f.get('authors'), ...extra() } });
       await onPick(id);
     }),
@@ -1161,9 +1182,10 @@ async function renderMembers() {
   app.innerHTML = `
     <h1>Members</h1>
     <div class="card"><table>
-      <thead><tr><th>Name</th><th>Library</th><th>Suggestions</th><th>Reviews</th><th>Joined</th></tr></thead>
+      <thead><tr><th>Name</th><th>Shelf</th><th>Library</th><th>Suggestions</th><th>Reviews</th><th>Joined</th></tr></thead>
       <tbody>${members
-        .map((m) => `<tr><td><strong>${esc(m.name)}</strong>${m.id === me.id ? ' <span class="pill">you</span>' : ''}</td>
+        .map((m) => `<tr><td><a href="#/shelves/${m.id}"><strong>${esc(m.name)}</strong></a>${m.id === me.id ? ' <span class="pill">you</span>' : ''}</td>
+          <td><a href="#/shelves/${m.id}">${m.shelf_count} post${m.shelf_count === 1 ? '' : 's'}</a></td>
           <td class="small">${esc(m.libby_name ?? '—')}</td><td>${m.suggestion_count}</td><td>${m.review_count}</td><td class="muted small">${esc(m.created_at.slice(0, 10))}</td></tr>`)
         .join('')}</tbody>
     </table></div>
@@ -1187,6 +1209,273 @@ async function renderMembers() {
       await refresh();
     }),
   );
+}
+
+// ------------------------------------------------------------ shelves
+
+const SHELF_STATUS = {
+  reading: { label: '📖 Reading', cls: 'accent' },
+  finished: { label: '✅ Finished', cls: 'good' },
+  abandoned: { label: '🛑 Gave up', cls: 'warn' },
+};
+
+function statusPicker(name, value = 'reading') {
+  return `<div class="row">${Object.entries(SHELF_STATUS)
+    .map(
+      ([k, s]) => `<label class="row small" style="font-weight:500;gap:6px;margin:0">
+        <input type="radio" name="${name}" value="${k}" ${k === value ? 'checked' : ''} /> ${s.label}</label>`,
+    )
+    .join('')}</div>`;
+}
+
+function ratingPicker(value) {
+  return `<div class="star-input" data-rating="${value ?? ''}">${[1, 2, 3, 4, 5]
+    .map((n) => `<button type="button" data-shelf-star="${n}" class="${n <= (value ?? 0) ? 'on' : ''}" aria-label="${n} stars">★</button>`)
+    .join('')} <button type="button" class="link small" data-shelf-star="0" style="font-size:0.85rem">clear</button></div>`;
+}
+
+function bindRatingPickers(root = app) {
+  $$('[data-shelf-star]', root).forEach((b) =>
+    b.addEventListener('click', (e) => {
+      const picker = e.currentTarget.closest('.star-input');
+      const n = Number(e.currentTarget.dataset.shelfStar);
+      picker.dataset.rating = n || '';
+      $$('[data-shelf-star]', picker).forEach((s) => s.classList.toggle('on', Number(s.dataset.shelfStar) > 0 && Number(s.dataset.shelfStar) <= n));
+    }),
+  );
+}
+
+function shelfPost(p, { compact = false } = {}) {
+  const mine = p.member_id === me.id;
+  const st = SHELF_STATUS[p.status] ?? SHELF_STATUS.reading;
+  const coverUrl = p.cover_url ? `<img class="cover sm" src="${esc(p.cover_url)}" alt="" loading="lazy" />` : `<div class="cover sm">${esc(p.title)}</div>`;
+  return `
+    <article class="card shelf-post" data-post="${p.id}">
+      <div class="book-row">
+        ${coverUrl}
+        <div style="flex:1;min-width:0">
+          <div class="row spread small">
+            <span><a href="#/shelves/${p.member_id}"><strong>${esc(p.member_name)}</strong></a> <span class="muted">· ${ago(p.updated_at)}</span></span>
+            <span class="pill ${st.cls}">${st.label}</span>
+          </div>
+          <div style="margin-top:4px"><strong style="font-family:Fraunces,Georgia,serif;font-size:1.05rem">${esc(p.title)}</strong>
+            <span class="small muted">${p.authors ? ` · ${esc(p.authors)}` : ''}</span></div>
+          ${p.rating ? `<div>${stars(p.rating)}</div>` : ''}
+          ${p.body ? `<p class="prose${compact ? ' clamp' : ''}" style="margin:6px 0 0">${esc(p.body)}</p>` : ''}
+          <div class="row small" style="margin-top:8px;gap:14px">
+            <button class="link small" data-comments="${p.id}">💬 ${p.comment_count ? `${p.comment_count} comment${p.comment_count === 1 ? '' : 's'}` : 'Comment'}</button>
+            ${
+              p.pool_book_id
+                ? `<a href="#/books/${p.pool_book_id}">📚 In the club suggestions</a>`
+                : p.status !== 'abandoned'
+                  ? `<button class="link small" data-suggest-post="${p.id}">📚 Suggest for the club</button>`
+                  : ''
+            }
+            ${mine ? `<button class="link small" data-edit-post="${p.id}">✎ Edit</button><button class="link small" data-delete-post="${p.id}">Delete</button>` : ''}
+          </div>
+        </div>
+      </div>
+      ${
+        mine
+          ? `<form class="edit-post stack small" data-post="${p.id}" hidden style="margin-top:12px">
+              ${statusPicker(`status-${p.id}`, p.status)}
+              ${ratingPicker(p.rating)}
+              <textarea name="body" placeholder="What do you think so far?">${esc(p.body ?? '')}</textarea>
+              <div class="row"><button class="primary small" type="submit">Save</button><button class="small" type="button" data-cancel-post="${p.id}">Cancel</button></div>
+            </form>`
+          : ''
+      }
+      <div class="comments" data-comments-for="${p.id}" hidden style="margin-top:12px"></div>
+    </article>`;
+}
+
+async function loadComments(postId) {
+  const box = $(`[data-comments-for="${postId}"]`);
+  const { comments } = await api(`/shelf/${postId}/comments`);
+  box.innerHTML = `
+    <div class="stack small" style="border-top:1px solid var(--border);padding-top:10px">
+      ${comments
+        .map(
+          (cm) => `<div><strong>${esc(cm.name)}</strong> <span class="muted">${ago(cm.created_at)}</span>
+            ${cm.member_id === me.id ? `<button class="link small" data-delete-comment="${cm.id}" data-post-id="${postId}">delete</button>` : ''}
+            <div class="prose">${esc(cm.body)}</div></div>`,
+        )
+        .join('')}
+      <form class="row comment-form" data-post="${postId}">
+        <input name="body" placeholder="Reply…" maxlength="2000" required style="flex:1;min-width:160px" />
+        <button class="small" type="submit">Send</button>
+      </form>
+    </div>`;
+  box.hidden = false;
+  $('.comment-form', box).addEventListener(
+    'submit',
+    action(async (e) => {
+      await api(`/shelf/${postId}/comments`, { method: 'POST', body: { body: new FormData(e.target).get('body') } });
+      await loadComments(postId);
+      setCommentCount(postId);
+    }),
+  );
+  $$('[data-delete-comment]', box).forEach((b) =>
+    b.addEventListener(
+      'click',
+      action(async (e) => {
+        await api(`/shelf/comments/${e.currentTarget.dataset.deleteComment}`, { method: 'DELETE' });
+        await loadComments(postId);
+        setCommentCount(postId);
+      }),
+    ),
+  );
+  $('input', box).focus();
+}
+
+function setCommentCount(postId) {
+  const n = $$(`[data-comments-for="${postId}"] .stack > div`).length;
+  const btn = $(`[data-comments="${postId}"]`);
+  if (btn) btn.textContent = `💬 ${n ? `${n} comment${n === 1 ? '' : 's'}` : 'Comment'}`;
+}
+
+let shelfCache = new Map();
+
+function bindShelfPosts() {
+  bindRatingPickers();
+  on('[data-comments]', 'click', action(async (e) => {
+    const id = e.currentTarget.dataset.comments;
+    const box = $(`[data-comments-for="${id}"]`);
+    if (!box.hidden) return void (box.hidden = true);
+    await loadComments(id);
+  }));
+  on('[data-edit-post]', 'click', (e) => {
+    const f = $(`form.edit-post[data-post="${e.currentTarget.dataset.editPost}"]`);
+    f.hidden = !f.hidden;
+  });
+  on('[data-cancel-post]', 'click', (e) => ($(`form.edit-post[data-post="${e.currentTarget.dataset.cancelPost}"]`).hidden = true));
+  on('form.edit-post', 'submit', action(async (e) => {
+    const f = e.target;
+    const id = f.dataset.post;
+    await api(`/shelf/${id}`, {
+      method: 'PATCH',
+      body: {
+        status: $(`input[name="status-${id}"]:checked`, f).value,
+        rating: $('.star-input', f).dataset.rating || null,
+        body: f.elements.body.value,
+      },
+    });
+    toast('Post updated');
+    await refresh();
+  }));
+  on('[data-delete-post]', 'click', action(async (e) => {
+    const btn = e.currentTarget;
+    if (!confirm('Delete this post and its comments?')) return;
+    await api(`/shelf/${btn.dataset.deletePost}`, { method: 'DELETE' });
+    btn.closest('.shelf-post')?.remove();
+    toast('Post deleted');
+    await refresh();
+  }));
+  on('[data-suggest-post]', 'click', action(async (e) => {
+    const p = shelfCache.get(Number(e.currentTarget.dataset.suggestPost));
+    if (!p) return;
+    const pitch = p.member_id === me.id ? p.body?.slice(0, 1000) : `${p.member_name} posted about it on their shelf`;
+    const { id } = await api('/books', {
+      method: 'POST',
+      body: p.source_id
+        ? { sourceId: p.source_id, suggestedBy: me.name, pitch }
+        : { title: p.title, authors: p.authors, suggestedBy: me.name, pitch },
+    });
+    toast('Added to the club suggestions');
+    location.hash = `#/books/${id}`;
+  }));
+}
+
+async function renderShelves(memberId) {
+  const [{ posts }, { members }] = await Promise.all([api(`/shelf${memberId ? `?member=${memberId}` : ''}`), api('/members')]);
+  shelfCache = new Map(posts.map((p) => [p.id, p]));
+  const who = memberId ? members.find((m) => m.id === memberId) : null;
+  if (memberId && !who) throw new Error('Member not found');
+  const isMe = memberId === me.id;
+  const heading = !memberId ? 'Shelves' : isMe ? 'My shelf' : `${who.name}’s shelf`;
+  const groups = memberId
+    ? [
+        ['Currently reading', posts.filter((p) => p.status === 'reading')],
+        ['Finished', posts.filter((p) => p.status === 'finished')],
+        ['Gave up', posts.filter((p) => p.status === 'abandoned')],
+      ].filter(([, list]) => list.length)
+    : [['', posts]];
+
+  app.innerHTML = `
+    <div class="row spread"><h1>${esc(heading)}</h1>
+      ${!memberId || isMe ? `<button class="primary" id="new-post">+ Post about a book</button>` : ''}</div>
+    <p class="muted" style="margin-top:-6px">${
+      memberId ? 'Books they’re reading or have read, club picks or not.' : 'What everyone is reading on their own time, club picks or not.'
+    }</p>
+    <div class="row small" style="margin:8px 0 4px">
+      <a class="pill ${!memberId ? 'accent' : ''}" href="#/shelves">Everyone</a>
+      ${members
+        .filter((m) => m.shelf_count || m.id === me.id)
+        .map((m) => `<a class="pill ${m.id === memberId ? 'accent' : ''}" href="#/shelves/${m.id}">${esc(m.id === me.id ? 'Me' : m.name)}</a>`)
+        .join('')}
+    </div>
+    <div id="post-form" class="card stack" hidden style="margin-top:12px">
+      <h3 style="margin:0">What are you reading?</h3>
+      <div id="post-book"></div>
+      <div id="post-search"></div>
+      <div>${statusPicker('status')}</div>
+      <div><label>Your rating <span class="muted small">(optional)</span></label>${ratingPicker(null)}</div>
+      <div><label for="post-body">Your thoughts</label>
+        <textarea id="post-body" maxlength="10000" placeholder="What’s grabbing you? What did you think? (Mark spoilers!)"></textarea></div>
+      <div class="row"><button class="primary" type="button" id="submit-post">Post</button><button type="button" id="cancel-post">Cancel</button></div>
+    </div>
+    ${
+      posts.length
+        ? groups.map(([title, list]) => `${title ? `<h2>${title} (${list.length})</h2>` : ''}<div class="stack" style="margin-top:12px">${list.map((p) => shelfPost(p)).join('')}</div>`).join('')
+        : `<div class="card flat empty" style="margin-top:12px">${isMe || !memberId ? 'No posts yet. Share what you’re reading with “Post about a book”.' : 'Nothing on this shelf yet.'}</div>`
+    }`;
+
+  let chosen = null;
+  const showChosen = () => {
+    $('#post-book').innerHTML = chosen
+      ? `<div class="book-row card flat" style="padding:10px">${cover(chosen, 'sm')}<div style="flex:1"><strong>${esc(chosen.title)}</strong>
+          <div class="small muted">${esc(chosen.authors.join(', '))}</div></div><button type="button" class="small" id="change-book">Change</button></div>`
+      : '';
+    $('#post-search').hidden = !!chosen;
+    on('#change-book', 'click', () => {
+      chosen = null;
+      showChosen();
+    });
+  };
+  if ($('#post-search')) {
+    bookSearch($('#post-search'), {
+      cta: 'Choose',
+      onSelect: (item) => {
+        chosen = item;
+        showChosen();
+      },
+    });
+  }
+  on('#new-post', 'click', () => {
+    $('#post-form').hidden = !$('#post-form').hidden;
+    if (!$('#post-form').hidden) $('#post-search input[type=search]').focus();
+  });
+  on('#cancel-post', 'click', () => ($('#post-form').hidden = true));
+  // A div rather than a form: the search widget inside has forms of its own.
+  on('#submit-post', 'click', action(async () => {
+    if (!chosen) throw new Error('Pick a book first — search for it above, or add it manually');
+    await api('/shelf', {
+      method: 'POST',
+      body: {
+        title: chosen.title,
+        authors: chosen.authors.join(', '),
+        cover_url: chosen.coverUrl,
+        published: chosen.published,
+        source_id: chosen.sourceId,
+        status: $('#post-form input[name=status]:checked').value,
+        rating: $('#post-form .star-input').dataset.rating || null,
+        body: $('#post-body').value,
+      },
+    });
+    toast('Posted!');
+    await refresh();
+  }));
+  bindShelfPosts();
 }
 
 // ------------------------------------------------------------ boot
