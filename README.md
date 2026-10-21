@@ -33,6 +33,9 @@ It runs entirely on Cloudflare: a Worker serves the API and the static frontend,
 - **Reading progress**: everyone's % complete and format (print, Kindle or Audible), visible to the
   whole club on the home page and the book page.
 - **Reviews**: 1–5 stars and an optional write-up.
+- **Shelves**: every member has a shelf for posting about books they're reading, finished or gave
+  up on (club picks or not), with optional stars and thoughts. Everyone sees a shared feed, can
+  comment, and can send a book from a shelf straight to the club suggestions.
 - **AI talking points**: an overview, themes, an icebreaker and 10–12 discussion questions grouped
   by topic, written for the specific book. Existing member reviews are used to tailor them. Uses
   Claude when an Anthropic API key is set, and otherwise falls back to Cloudflare Workers AI
